@@ -1,13 +1,21 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+)
+
+var (
+	bookmarkFilePath string
+	actionFlag       string
+	queryFlag        string
 )
 
 const (
@@ -27,22 +35,53 @@ type Bookmarks struct {
 }
 
 func main() {
-	action := "find"
-	if len(os.Args) > 1 {
-		action = os.Args[1]
+	defaultBookmarksFile, err := getDefaultBookmarksFilePath()
+	if err != nil {
+		os.Exit(1)
+	}
+	flag.StringVar(&bookmarkFilePath, "file", defaultBookmarksFile, "Path to the bookmarks YAML file")
+	flag.StringVar(&actionFlag, "action", "find", "Action to perform: 'add' or 'find'")
+	flag.StringVar(&queryFlag, "query", "", "Query string for 'find' action")
+	flag.Parse()
+
+	// Ensure the directory for the bookmark file exists
+	bookmarkDir := filepath.Dir(bookmarkFilePath)
+	if _, err := os.Stat(bookmarkDir); os.IsNotExist(err) {
+		notify(fmt.Sprintf("Failed to find bookmark directory \"%s\": %v", bookmarkDir, err))
+		os.Exit(1)
 	}
 
+	run(actionFlag, queryFlag)
+}
+
+func getDefaultBookmarksFilePath() (string, error) {
+	// Determine default config directory (XDG_CONFIG_HOME or $HOME/.config)
+	userConfigDir, err := os.UserConfigDir()
+	if err != nil {
+		// Fallback if os.UserConfigDir fails
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Println("Error getting home directory:", err)
+			return "", err
+		}
+		userConfigDir = filepath.Join(homeDir, ".config")
+	}
+
+	// Construct the default bookmarks file path
+	return filepath.Join(userConfigDir, "bookmarkit", "bookmarks.yml"), nil
+}
+
+func run(action, query string) {
 	switch action {
 	case "add":
+		if query != "" {
+			fmt.Printf("[!] You don't need the query flag with the 'add' command")
+		}
 		addBookmark()
 	case "find":
-		var query string
-		if len(os.Args) > 2 {
-			query = os.Args[2]
-		}
 		findBookmark(query)
 	default:
-		fmt.Println("[!] unsupported action \"" + action + "\"")
+		fmt.Printf("[!] unsupported action \"%s\"", action)
 		os.Exit(1)
 	}
 }
@@ -125,7 +164,6 @@ func findBookmark(query string) {
 func getYADInput() (string, string) {
 	clipboardContent := getClipboardContent()
 
-	fmt.Printf("clipboard: %s\n", clipboardContent)
 	cmd := exec.Command("yad",
 		"--form",
 		"--title", dialogTitle,
@@ -136,27 +174,20 @@ func getYADInput() (string, string) {
 		"--field=Key", "",
 		"--field=Bookmark", fmt.Sprintf("%s", clipboardContent))
 
-	fmt.Printf("yad command: %s\n", cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Printf("YAD error: %v\n", err)
 		return "", ""
 	}
 
-	fmt.Printf("yad returned: '%s'\n", string(out))
 	result := strings.TrimSpace(string(out))
 
-	fmt.Printf("Separator: '%s'\n", separator)
-	fmt.Printf("Result length: %d\n", len(result))
-	fmt.Printf("Result characters: ")
 	for i, r := range result {
 		fmt.Printf("%d:%U ", i, r)
 	}
 	fmt.Println()
 
 	separatorIndex := strings.Index(result, separator)
-
-	fmt.Printf("Separator index: %d\n", separatorIndex)
 
 	if separatorIndex == -1 {
 		fmt.Printf("Separator '%s' not found in result\n", separator)
@@ -166,9 +197,6 @@ func getYADInput() (string, string) {
 	key := result[:separatorIndex]
 	book := result[separatorIndex+len(separator):]
 	book = strings.TrimSuffix(book, separator)
-
-	fmt.Printf("Key: '%s'\n", key)
-	fmt.Printf("Book: '%s'\n", book)
 
 	return key, book
 }
