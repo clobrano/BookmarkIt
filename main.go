@@ -1,15 +1,18 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/clobrano/BookmarkIt/internal/bookmark"
+	"github.com/clobrano/BookmarkIt/internal/config"
+	"github.com/clobrano/BookmarkIt/internal/system"
+	"github.com/clobrano/BookmarkIt/internal/ui"
 )
 
 var (
@@ -18,118 +21,99 @@ var (
 	queryFlag        string
 )
 
-const (
-	bookmarksFile = "$HOME/Documents/bookmarks.yml"
-	dialogTitle   = "BookmarkIt"
-	dialogText    = "Please enter the your bookmark and a key"
-	separator     = "___"
-)
-
-type Bookmark struct {
-	Key  string `yaml:"key"`
-	Link string `yaml:"link"`
-}
-
-type Bookmarks struct {
-	Bookmarks []Bookmark `yaml:"bookmarks"`
-}
-
 func main() {
-	defaultBookmarksFile, err := getDefaultBookmarksFilePath()
+	// 1. Get default bookmark file path
+	defaultBookmarksFile, err := config.GetDefaultBookmarksFilePath()
 	if err != nil {
+		system.Notify(fmt.Sprintf("Error getting default bookmark file path: %v", err))
 		os.Exit(1)
 	}
+
+	// 2. Parse flags
 	flag.StringVar(&bookmarkFilePath, "file", defaultBookmarksFile, "Path to the bookmarks YAML file")
 	flag.StringVar(&actionFlag, "action", "find", "Action to perform: 'add' or 'find'")
 	flag.StringVar(&queryFlag, "query", "", "Query string for 'find' action")
 	flag.Parse()
 
-	// Ensure the directory for the bookmark file exists
+	// 3. Ensure bookmark directory exists, create if not
 	bookmarkDir := filepath.Dir(bookmarkFilePath)
 	if _, err := os.Stat(bookmarkDir); os.IsNotExist(err) {
-		notify(fmt.Sprintf("Failed to find bookmark directory \"%s\": %v", bookmarkDir, err))
+		if err := os.MkdirAll(bookmarkDir, 0755); err != nil {
+			system.Notify(fmt.Sprintf("Failed to create bookmark directory \"%s\": %v", bookmarkDir, err))
+			os.Exit(1)
+		}
+	} else if err != nil {
+		system.Notify(fmt.Sprintf("Failed to check bookmark directory \"%s\": %v", bookmarkDir, err))
 		os.Exit(1)
 	}
 
-	run(actionFlag, queryFlag)
-}
-
-func getDefaultBookmarksFilePath() (string, error) {
-	// Determine default config directory (XDG_CONFIG_HOME or $HOME/.config)
-	userConfigDir, err := os.UserConfigDir()
-	if err != nil {
-		// Fallback if os.UserConfigDir fails
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Println("Error getting home directory:", err)
-			return "", err
-		}
-		userConfigDir = filepath.Join(homeDir, ".config")
+	// 4. Run the main action
+	if err := run(bookmarkFilePath, actionFlag, queryFlag); err != nil {
+		system.Notify(fmt.Sprintf("Operation failed: %v", err))
+		os.Exit(1)
 	}
-
-	// Construct the default bookmarks file path
-	return filepath.Join(userConfigDir, "bookmarkit", "bookmarks.yml"), nil
 }
 
-func run(action, query string) {
+func run(filePath, action, query string) error {
 	switch action {
 	case "add":
 		if query != "" {
-			fmt.Printf("[!] You don't need the query flag with the 'add' command")
+			system.Notify("[!] You don't need the query flag with the 'add' command")
 		}
-		addBookmark()
+		return addBookmark(filePath)
 	case "find":
-		findBookmark(query)
+		return findBookmark(filePath, query)
 	default:
-		fmt.Printf("[!] unsupported action \"%s\"", action)
-		os.Exit(1)
+		return fmt.Errorf("[!] unsupported action \"%s\"", action)
 	}
 }
 
-func addBookmark() {
-	key, book := getYADInput()
-	if key == "" {
-		notify("failed: key is empty")
-		os.Exit(1)
+func addBookmark(filePath string) error {
+	clipboardContent, err := system.GetClipboardContent()
+	if err != nil {
+		system.Notify(fmt.Sprintf("Could not get clipboard content: %v", err))
+		// Continue without clipboard content
+		clipboardContent = ""
 	}
-	if book == "" {
-		notify("failed: bookmark is empty")
-		os.Exit(1)
+
+	key, link, err := ui.GetYADInput(clipboardContent)
+	if err != nil {
+		return fmt.Errorf("failed to get YAD input: %w", err)
+	}
+	if key == "" {
+		return fmt.Errorf("failed: key is empty")
+	}
+	if link == "" {
+		return fmt.Errorf("failed: bookmark is empty")
 	}
 
 	key = strings.ReplaceAll(key, " ", "_")
 
-	bookmarks, err := loadBookmarks()
+	bookmarks, err := bookmark.Load(filePath)
 	if err != nil {
-		notify(fmt.Sprintf("Failed to load bookmarks: %v", err))
-		os.Exit(1)
+		return fmt.Errorf("failed to load bookmarks: %w", err)
 	}
 
-	// Check if bookmark already exists
-	for _, bm := range bookmarks.Bookmarks {
-		if bm.Link == book {
-			notify("This URL was already bookmarked")
-			return
-		}
+	if bookmarks.HasLink(link) {
+		system.Notify("This URL was already bookmarked")
+		return nil
 	}
 
-	newBookmark := Bookmark{Key: key, Link: book}
-	bookmarks.Bookmarks = append(bookmarks.Bookmarks, newBookmark)
+	bookmarks.Add(key, link)
 
-	err = saveBookmarks(bookmarks)
+	err = bookmark.Save(bookmarks, filePath)
 	if err != nil {
-		notify(fmt.Sprintf("Failed to save bookmarks: %v", err))
-		os.Exit(1)
+		return fmt.Errorf("failed to save bookmarks: %w", err)
 	}
 
-	notify(fmt.Sprintf("%s stored in Bookmark", key))
+	system.Notify(fmt.Sprintf("'%s' stored in Bookmark", key))
+	return nil
 }
 
-func findBookmark(query string) {
-	bookmarks, err := loadBookmarks()
+func findBookmark(filePath, query string) error {
+	bookmarks, err := bookmark.Load(filePath)
 	if err != nil {
-		notify(fmt.Sprintf("Failed to load bookmarks: %v", err))
-		os.Exit(1)
+		return fmt.Errorf("failed to load bookmarks: %w", err)
 	}
 
 	var options []string
@@ -137,218 +121,36 @@ func findBookmark(query string) {
 		options = append(options, bm.Key+" => "+bm.Link)
 	}
 
-	selection := showFZF(options, query)
+	selection, err := ui.ShowFZF(options, query)
+	if err != nil {
+		var exitErr *osexec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 130 { // 130 is common for Ctrl+C exit
+			return nil // User cancelled FZF, not an error
+		}
+		return fmt.Errorf("failed to get FZF selection: %w", err)
+	}
 	if selection == "" {
-		os.Exit(0)
+		return nil // User selected nothing or FZF returned empty
 	}
 
 	parts := strings.Split(selection, " => ")
 	if len(parts) != 2 {
-		notify("Invalid selection format")
-		os.Exit(1)
+		return fmt.Errorf("invalid selection format from FZF: %s", selection)
 	}
 
 	link := parts[1]
-	if strings.HasPrefix(link, "https://") {
-		err := openURL(link)
+	if strings.HasPrefix(link, "https://") || strings.HasPrefix(link, "http://") {
+		err := system.OpenURL(link)
 		if err != nil {
-			notify(fmt.Sprintf("Failed to open URL: %v", err))
-			os.Exit(1)
+			return fmt.Errorf("failed to open URL: %w", err)
 		}
+		system.Notify(fmt.Sprintf("Opened URL: '%s'", link))
 	} else {
-		copyToClipboard(link)
-		notify(fmt.Sprintf("added to clipboard: '%s'", link))
-	}
-}
-
-func getYADInput() (string, string) {
-	clipboardContent := getClipboardContent()
-
-	cmd := exec.Command("yad",
-		"--form",
-		"--title", dialogTitle,
-		"--text", dialogText,
-		"--width=650",
-		"--height=150",
-		fmt.Sprintf("--separator=%s", separator),
-		"--field=Key", "",
-		"--field=Bookmark", fmt.Sprintf("%s", clipboardContent))
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("YAD error: %v\n", err)
-		return "", ""
-	}
-
-	result := strings.TrimSpace(string(out))
-
-	for i, r := range result {
-		fmt.Printf("%d:%U ", i, r)
-	}
-	fmt.Println()
-
-	separatorIndex := strings.Index(result, separator)
-
-	if separatorIndex == -1 {
-		fmt.Printf("Separator '%s' not found in result\n", separator)
-		return "", ""
-	}
-
-	key := result[:separatorIndex]
-	book := result[separatorIndex+len(separator):]
-	book = strings.TrimSuffix(book, separator)
-
-	return key, book
-}
-
-func showFZF(options []string, query string) string {
-	fzfCmd := exec.Command("fzf",
-		"--prompt", "Search bookmark > ",
-		"--layout", "reverse",
-		"--height=70%",
-		"--bind", "ctrl-y:execute(readlink -f {} | echo {} | cut -d'>' -f2 | tr -d '\\n' | xclip -selection clipboard)+abort")
-
-	if query != "" {
-		fzfCmd.Args = append(fzfCmd.Args, "--query="+query)
-	}
-
-	fzfIn, _ := fzfCmd.StdinPipe()
-	fzfOut, _ := fzfCmd.StdoutPipe()
-
-	err := fzfCmd.Start()
-	if err != nil {
-		notify(fmt.Sprintf("Failed to start fzf: %v", err))
-		os.Exit(1)
-	}
-
-	for _, opt := range options {
-		fmt.Fprintln(fzfIn, opt)
-	}
-	fzfIn.Close()
-
-	outputBytes, err := io.ReadAll(fzfOut)
-	if err != nil {
-		fmt.Printf("Error reading from fzf output: %v\n", err)
-		return ""
-	}
-	fzfCmd.Wait()
-
-	return strings.TrimSpace(string(outputBytes))
-}
-
-func loadBookmarks() (Bookmarks, error) {
-	var bookmarks Bookmarks
-	filePath := os.ExpandEnv(bookmarksFile)
-
-	_, err := os.Stat(filePath)
-	if os.IsNotExist(err) {
-		// Create the file if it doesn't exist
-		emptyBookmarks := Bookmarks{Bookmarks: []Bookmark{}}
-		err = saveBookmarks(emptyBookmarks)
+		err := system.CopyToClipboard(link)
 		if err != nil {
-			return bookmarks, fmt.Errorf("failed to create bookmarks file: %w", err)
+			return fmt.Errorf("failed to copy to clipboard: %w", err)
 		}
-	} else if err != nil {
-		return bookmarks, fmt.Errorf("failed to check if bookmarks file exists: %w", err)
-	}
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return bookmarks, fmt.Errorf("failed to read bookmarks file: %w", err)
-	}
-
-	err = yaml.Unmarshal(data, &bookmarks)
-	if err != nil {
-		return bookmarks, fmt.Errorf("failed to unmarshal bookmarks: %w", err)
-	}
-
-	return bookmarks, nil
-}
-
-func saveBookmarks(bookmarks Bookmarks) error {
-	filePath := os.ExpandEnv(bookmarksFile)
-	data, err := yaml.Marshal(bookmarks)
-	if err != nil {
-		return fmt.Errorf("failed to marshal bookmarks: %w", err)
-	}
-
-	err = os.WriteFile(filePath, data, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write bookmarks file: %w", err)
-	}
-
-	return nil
-}
-
-func openURL(url string) error {
-	cmd := exec.Command("xdg-open", url)
-	err := cmd.Start()
-	if err != nil {
-		return fmt.Errorf("failed to open URL: %w", err)
+		system.Notify(fmt.Sprintf("Copied to clipboard: '%s'", link))
 	}
 	return nil
-}
-
-func copyToClipboard(text string) {
-	var cmd *exec.Cmd
-	if _, err := exec.LookPath("wl-copy"); err == nil {
-		cmd = exec.Command("wl-copy")
-	} else if _, err := exec.LookPath("xclip"); err == nil {
-		cmd = exec.Command("xclip", "-selection", "clipboard")
-	} else {
-		notify("Neither wl-copy nor xclip is available.")
-		return
-	}
-
-	pipe, err := cmd.StdinPipe()
-	if err != nil {
-		notify(fmt.Sprintf("Error getting stdin pipe: %v", err))
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		notify(fmt.Sprintf("Error starting command: %v", err))
-		return
-	}
-	_, err = pipe.Write([]byte(text))
-	if err != nil {
-		notify(fmt.Sprintf("Error writing to pipe: %v", err))
-		return
-	}
-	pipe.Close()
-	err = cmd.Wait()
-	if err != nil {
-		notify(fmt.Sprintf("Error waiting for command: %v", err))
-	}
-}
-
-func notify(message string) {
-	if _, err := exec.LookPath("notify-send"); err == nil {
-		cmd := exec.Command("notify-send", "--app-name", "BookMarkIt", "-i", "dialog-information", message)
-		err := cmd.Run()
-		if err != nil {
-			fmt.Printf("Error sending notification: %v\n", err)
-		}
-	} else {
-		fmt.Println(message)
-	}
-}
-
-func getClipboardContent() string {
-	var cmd *exec.Cmd
-	if _, err := exec.LookPath("wl-paste"); err == nil {
-		cmd = exec.Command("wl-paste", "--no-newline")
-	} else if _, err := exec.LookPath("xclip"); err == nil {
-		cmd = exec.Command("xclip", "-selection", "clipboard", "-o")
-	} else {
-		notify("Neither wl-paste nor xclip is available.")
-		return ""
-	}
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Error getting clipboard content: %v\n", err)
-		return ""
-	}
-
-	return strings.TrimSpace(string(out))
 }
